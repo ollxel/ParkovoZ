@@ -22,7 +22,7 @@
 
 1. Клонируйте репозиторий:
 ```bash
-git clone https://github.com/yourusername/vehicle-detection-system.git
+git clone https://github.com/ollxel/ParkovoZ.git
 cd vehicle-detection-system
 ```
 
@@ -87,8 +87,7 @@ vehicle-detection-system/
 ├── yolov4-tiny.cfg           # Конфигурация модели YOLO
 ├── yolov4-tiny.weights       # Веса модели YOLO
 ├── coco.names                # Названия классов COCO
-├── road.mp4             # Пример видеофайла (опционально)
-└── README.md              # Данная документация
+└── README.md                 # Данная документация
 ```
 
 ## Советы по производительности
