@@ -87,8 +87,7 @@ vehicle-detection-system/
 ├── yolov4-tiny.cfg           # Конфигурация модели YOLO
 ├── yolov4-tiny.weights       # Веса модели YOLO
 ├── coco.names                # Названия классов COCO
-├── car_video.avi             # Пример видеофайла (опционально)
-├── demo.gif                  # Демонстрационная анимация
+├── road.mp4             # Пример видеофайла (опционально)
 └── README.md              # Данная документация
 ```
 
