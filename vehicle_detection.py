@@ -3,15 +3,21 @@ import numpy as np
 import os
 import time
 import argparse
+import requests
+from datetime import datetime
+import threading
+import queue
 
 # Настройка аргументов командной строки
-parser = argparse.ArgumentParser(description='Vehicle Detection System')
-parser.add_argument('--input', type=str, required=True, help='Path to input image or video')
+parser = argparse.ArgumentParser(description='Parking Lot Monitoring System')
+parser.add_argument('--url', type=str, required=True, help='Camera stream URL')
 parser.add_argument('--output', type=str, default='output', help='Output directory for results')
 parser.add_argument('--confidence', type=float, default=0.5, help='Confidence threshold')
 parser.add_argument('--nms', type=float, default=0.4, help='NMS threshold')
-parser.add_argument('--size', type=int, default=416, help='Input size for network (320, 416 or 512)')
-parser.add_argument('--fps', type=int, default=10, help='Target FPS for video processing')
+parser.add_argument('--size', type=int, default=320, help='Input size for network')
+parser.add_argument('--fps', type=int, default=15, help='Target FPS for video processing')
+parser.add_argument('--device', type=str, default='cpu', choices=['cpu', 'gpu'], help='Device for inference')
+parser.add_argument('--spots', type=str, default='parking_spots.txt', help='File to save/load parking spots')
 args = parser.parse_args()
 
 # Создаем директорию для результатов
@@ -20,8 +26,16 @@ os.makedirs(args.output, exist_ok=True)
 # Загрузка модели YOLOv4-tiny
 print("[INFO] Загрузка модели YOLOv4-tiny...")
 net = cv2.dnn.readNetFromDarknet("yolov4-tiny.cfg", "yolov4-tiny.weights")
-net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
-net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
+
+# Настройка устройства для вычислений
+if args.device == 'gpu':
+    net.setPreferableBackend(cv2.dnn.DNN_BACKEND_CUDA)
+    net.setPreferableTarget(cv2.dnn.DNN_TARGET_CUDA)
+    print("[INFO] Используется GPU для вычислений")
+else:
+    net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
+    net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
+    print("[INFO] Используется CPU для вычислений")
 
 # Загрузка названий классов
 with open("coco.names", "r") as f:
@@ -34,6 +48,45 @@ VEHICLE_IDS = [2, 3, 5, 7]  # car, motorcycle, bus, truck
 layer_names = net.getLayerNames()
 output_layers = [layer_names[i - 1] for i in net.getUnconnectedOutLayers()]
 
+# Статус записи видео
+is_recording = False
+video_writer = None
+recording_start_time = None
+MAX_RECORDING_MINUTES = 5
+
+# Очередь для многопоточной загрузки кадров
+frame_queue = queue.Queue(maxsize=2)
+stop_event = threading.Event()
+
+# Состояние парковочных мест
+parking_spots = []  # список кортежей (x, y, status): 0=свободно, 1=занято
+marking_mode = False
+current_spot_id = 0
+
+def image_loader(url):
+    """Поток для загрузки изображений"""
+    last_frame = None
+    while not stop_event.is_set():
+        try:
+            response = requests.get(url, timeout=2, stream=True)
+            response.raise_for_status()
+            img_array = np.frombuffer(response.content, dtype=np.uint8)
+            frame = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+            if frame is not None:
+                last_frame = frame
+                if frame_queue.full():
+                    try:
+                        frame_queue.get_nowait()
+                    except queue.Empty:
+                        pass
+                frame_queue.put(frame.copy())
+            else:
+                if last_frame is not None:
+                    frame_queue.put(last_frame.copy())
+        except:
+            if last_frame is not None:
+                frame_queue.put(last_frame.copy())
+        time.sleep(0.05)
 
 def detect_vehicles(image):
     """Обнаружение транспортных средств на изображении"""
@@ -56,6 +109,7 @@ def detect_vehicles(image):
     boxes = []
     confidences = []
     class_ids = []
+    centers = []  # центры bounding box'ов
 
     for output in outputs:
         for detection in output:
@@ -77,166 +131,439 @@ def detect_vehicles(image):
                 w, h = min(width - x, int(w)), min(height - y, int(h))
 
                 boxes.append([x, y, w, h])
+                centers.append((int(center_x), int(center_y)))
                 confidences.append(float(confidence))
                 class_ids.append(class_id)
 
     # Применяем Non-Maximum Suppression
     indices = cv2.dnn.NMSBoxes(boxes, confidences, args.confidence, args.nms)
 
-    return boxes, confidences, class_ids, indices
-
-
-def process_image(image_path):
-    """Обработка изображения"""
-    print(f"[INFO] Обработка изображения: {image_path}")
-    image = cv2.imread(image_path)
-
-    if image is None:
-        print(f"[ERROR] Не удалось загрузить изображение: {image_path}")
-        return
-
-    # Измеряем время обработки
-    start_time = time.time()
-    boxes, confidences, class_ids, indices = detect_vehicles(image)
-    processing_time = time.time() - start_time
-
-    # Счетчик транспортных средств
-    vehicle_count = len(indices) if len(indices) > 0 else 0
-
-    # Рисуем bounding boxes
-    if vehicle_count > 0:
+    # Фильтруем результаты после NMS
+    filtered_boxes = []
+    filtered_centers = []
+    if len(indices) > 0:
         for i in indices.flatten():
-            (x, y, w, h) = boxes[i]
+            filtered_boxes.append(boxes[i])
+            filtered_centers.append(centers[i])
 
-            # Рисуем прямоугольник
-            cv2.rectangle(image, (x, y), (x + w, y + h), (0, 255, 0), 2)
+    return filtered_boxes, confidences, class_ids, indices, filtered_centers
 
-            # Добавляем подпись
-            label = f"{classes[class_ids[i]]}: {confidences[i]:.2f}"
-            cv2.putText(image, label, (x, y - 5),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+def create_video_capture(url):
+    """Создает объект VideoCapture для потокового видео"""
+    cap = cv2.VideoCapture(url)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    cap.set(cv2.CAP_PROP_FPS, args.fps)
+    return cap
 
-    # Сохраняем результат
-    filename = os.path.basename(image_path)
-    output_path = os.path.join(args.output, f"detected_{filename}")
-    cv2.imwrite(output_path, image)
+def save_parking_spots(filename):
+    """Сохраняет координаты парковочных мест в файл"""
+    with open(filename, 'w') as f:
+        for spot in parking_spots:
+            f.write(f"{spot[0]},{spot[1]},{spot[2]}\n")
+    print(f"[INFO] Сохранено {len(parking_spots)} парковочных мест в {filename}")
 
-    # Выводим статистику
-    print(f"[РЕЗУЛЬТАТ] Обнаружено транспортных средств: {vehicle_count}")
-    print(f"[РЕЗУЛЬТАТ] Время обработки: {processing_time:.3f} сек")
-    print(f"[РЕЗУЛЬТАТ] Результат сохранен в: {output_path}")
+def load_parking_spots(filename):
+    """Загружает координаты парковочных мест из файла"""
+    global parking_spots
+    if os.path.exists(filename):
+        parking_spots = []
+        with open(filename, 'r') as f:
+            for line in f:
+                parts = line.strip().split(',')
+                if len(parts) >= 3:
+                    x, y, status = int(parts[0]), int(parts[1]), int(parts[2])
+                    parking_spots.append((x, y, status))
+        print(f"[INFO] Загружено {len(parking_spots)} парковочных мест из {filename}")
+        return True
+    return False
 
-    # Показываем результат
-    cv2.imshow("Vehicle Detection", image)
-    cv2.waitKey(0)
-    cv2.destroyAllWindows()
+def mouse_callback(event, x, y, flags, param):
+    """Обработчик событий мыши для разметки парковочных мест"""
+    global marking_mode, parking_spots, frame_copy
+    
+    if marking_mode:
+        if event == cv2.EVENT_LBUTTONDOWN:
+            # Добавляем свободное место (зеленое)
+            parking_spots.append((x, y, 0))
+            print(f"Добавлено свободное место {len(parking_spots)}: ({x}, {y})")
+            # Рисуем точку на изображении
+            cv2.circle(frame_copy, (x, y), 8, (0, 255, 0), -1)
+            cv2.putText(frame_copy, str(len(parking_spots)), (x+10, y+10), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            cv2.imshow("Mark Parking Spots", frame_copy)
+        
+        elif event == cv2.EVENT_RBUTTONDOWN:
+            # Добавляем занятое место (красное)
+            parking_spots.append((x, y, 1))
+            print(f"Добавлено занятое место {len(parking_spots)}: ({x}, {y})")
+            # Рисуем точку на изображении
+            cv2.circle(frame_copy, (x, y), 8, (0, 0, 255), -1)
+            cv2.putText(frame_copy, str(len(parking_spots)), (x+10, y+10), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+            cv2.imshow("Mark Parking Spots", frame_copy)
 
+def mark_parking_spots(frame):
+    """Режим ручной разметки парковочных мест"""
+    global marking_mode, frame_copy, parking_spots
+    
+    marking_mode = True
+    frame_copy = frame.copy()
+    
+    # Создаем окно для разметки
+    cv2.namedWindow("Mark Parking Spots")
+    cv2.setMouseCallback("Mark Parking Spots", mouse_callback, param=frame)
+    
+    # Инструкция
+    print("\n=== РЕЖИМ РАЗМЕТКИ ПАРКОВОЧНЫХ МЕСТ ===")
+    print("ЛКМ - добавить свободное место (зеленое)")
+    print("ПКМ - добавить занятое место (красное)")
+    print("'z' - удалить последнее добавленное место")
+    print("'s' - сохранить разметку")
+    print("'c' - отменить и выйти")
+    
+    while True:
+        cv2.imshow("Mark Parking Spots", frame_copy)
+        key = cv2.waitKey(1) & 0xFF
+        
+        if key == ord('s'):
+            if parking_spots:
+                save_parking_spots(args.spots)
+                marking_mode = False
+                cv2.destroyWindow("Mark Parking Spots")
+                return True
+            else:
+                print("[WARNING] Нет парковочных мест для сохранения!")
+        
+        elif key == ord('c'):
+            parking_spots = []
+            marking_mode = False
+            cv2.destroyWindow("Mark Parking Spots")
+            print("[INFO] Разметка отменена")
+            return False
+        
+        elif key == ord('z'):
+            # Удаляем последнее добавленное место
+            if parking_spots:
+                removed = parking_spots.pop()
+                print(f"Удалено парковочное место: {removed}")
+                # Перерисовываем изображение
+                frame_copy = frame.copy()
+                for i, (x, y, status) in enumerate(parking_spots):
+                    color = (0, 255, 0) if status == 0 else (0, 0, 255)
+                    cv2.circle(frame_copy, (x, y), 8, color, -1)
+                    cv2.putText(frame_copy, str(i+1), (x+10, y+10), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+                cv2.imshow("Mark Parking Spots", frame_copy)
 
-def process_video(video_path):
-    """Обработка видео"""
-    print(f"[INFO] Обработка видео: {video_path}")
+def process_stream():
+    """Обработка потока с камеры в реальном времени"""
+    global is_recording, video_writer, recording_start_time, parking_spots, marking_mode
 
-    # Открываем видео
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        print(f"[ERROR] Не удалось открыть видео: {video_path}")
-        return
+    print(f"[INFO] Запуск мониторинга парковки: {args.url}")
 
-    # Получаем свойства видео
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    # Автоматическое определение типа потока
+    is_video_stream = False
+    cap = None
+    last_success_time = time.time()
 
-    # Создаем VideoWriter для сохранения результата
-    fourcc = cv2.VideoWriter_fourcc(*'XVID')
-    output_path = os.path.join(args.output, "detected_video.avi")
-    out = cv2.VideoWriter(output_path, fourcc, args.fps, (width, height))
+    # Попытка инициализировать как видеопоток
+    if "mjpg" in args.url.lower() or "stream" in args.url.lower():
+        try:
+            cap = create_video_capture(args.url)
+            if cap.isOpened():
+                ret, test_frame = cap.read()
+                if ret and test_frame is not None:
+                    is_video_stream = True
+                    print("[INFO] Режим: MJPEG видеопоток")
+                else:
+                    cap.release()
+                    cap = None
+        except:
+            pass
 
-    print(f"[INFO] Разрешение: {width}x{height}")
-    print(f"[INFO] Частота кадров: {fps:.2f}")
-    print(f"[INFO] Всего кадров: {total_frames}")
-    print(f"[INFO] Целевая частота обработки: {args.fps} FPS")
+    # Запускаем поток загрузки изображений для статичного режима
+    if not is_video_stream:
+        print("[INFO] Режим: Статичное изображение (многопоточная загрузка)")
+        loader_thread = threading.Thread(target=image_loader, args=(args.url,), daemon=True)
+        loader_thread.start()
+
+    # Создаем окно для отображения
+    cv2.namedWindow("Parking Lot Monitoring", cv2.WINDOW_NORMAL)
+    cv2.resizeWindow("Parking Lot Monitoring", 1000, 700)
 
     frame_count = 0
+    total_vehicles = 0
     start_time = time.time()
-    skip_frames = max(1, int(fps / args.fps))  # Пропускаем кадры для достижения целевого FPS
+    last_frame_time = time.time()
+    frame = None
+    reconnect_attempts = 0
+    last_stat_update = time.time()
+    stats_interval = 0.5
+    current_fps = 0
+    vehicle_count = 0
+    first_frame_processed = False
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
+    try:
+        while True:
+            current_time = time.time()
+            # Контроль FPS
+            elapsed = current_time - last_frame_time
+            sleep_time = (1.0 / args.fps) - elapsed
+            if sleep_time > 0:
+                time.sleep(sleep_time)
 
-        frame_count += 1
+            last_frame_time = time.time()
+            frame_count += 1
 
-        # Пропускаем кадры для достижения целевого FPS
-        if frame_count % skip_frames != 0:
-            continue
+            # Получаем кадр в зависимости от типа потока
+            if is_video_stream and cap is not None:
+                ret, frame = cap.read()
+                if not ret or frame is None:
+                    # Проблемы с чтением кадра
+                    if current_time - last_success_time > 5:
+                        print("Ошибка чтения видеопотока. Попытка переподключения...")
+                        cap.release()
+                        cap = create_video_capture(args.url)
+                        reconnect_attempts += 1
 
-        # Обрабатываем каждый N-й кадр
-        boxes, confidences, class_ids, indices = detect_vehicles(frame)
-        vehicle_count = len(indices) if len(indices) > 0 else 0
+                        # Если переподключение не удалось 5 раз, переключаем режим
+                        if reconnect_attempts > 5 or not cap.isOpened():
+                            print("Не удалось восстановить видеопоток. Переключение на режим статичного изображения")
+                            is_video_stream = False
+                            loader_thread = threading.Thread(target=image_loader, args=(args.url,), daemon=True)
+                            loader_thread.start()
+                    continue
+                last_success_time = current_time
+                reconnect_attempts = 0
+            else:
+                try:
+                    frame = frame_queue.get_nowait()
+                except queue.Empty:
+                    frame = None
 
-        # Рисуем bounding boxes
-        if vehicle_count > 0:
-            for i in indices.flatten():
-                (x, y, w, h) = boxes[i]
+            if frame is None:
+                # Показываем последний успешный кадр, если он есть
+                if 'last_good_frame' in locals():
+                    frame = last_good_frame
+                else:
+                    continue
 
-                # Рисуем прямоугольник
-                cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+            # Кэшируем хороший кадр
+            last_good_frame = frame.copy()
+            
+            # Автоматический вход в режим разметки при первом кадре, если файл не найден
+            if not first_frame_processed:
+                first_frame_processed = True
+                if not os.path.exists(args.spots):
+                    print("[INFO] Файл с разметкой не найден, запуск режима разметки...")
+                    if mark_parking_spots(frame):
+                        print("[INFO] Разметка парковочных мест сохранена")
+                    else:
+                        print("[INFO] Разметка парковочных мест отменена, выход")
+                        break
 
-                # Добавляем подпись
-                label = f"{classes[class_ids[i]]}"
-                cv2.putText(frame, label, (x, y - 5),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+            # Обнаруживаем транспортные средства
+            boxes, confidences, class_ids, indices, centers = detect_vehicles(frame)
+            vehicle_count = len(indices) if isinstance(indices, np.ndarray) else 0
+            total_vehicles += vehicle_count
 
-        # Добавляем статистику на кадр
-        elapsed_time = time.time() - start_time
-        current_fps = frame_count / elapsed_time if elapsed_time > 0 else 0
+            # Определяем занятость парковочных мест
+            occupied_spots = [False] * len(parking_spots)
+            
+            # Проверяем для каждого парковочного места
+            for i, (x, y, _) in enumerate(parking_spots):
+                for center in centers:
+                    # Проверяем расстояние от центра машины до точки парковки
+                    distance = np.sqrt((x - center[0])**2 + (y - center[1])**2)
+                    # Если расстояние меньше порога (15 пикселей), считаем место занятым
+                    if distance < 15:
+                        occupied_spots[i] = True
+                        break
 
-        cv2.putText(frame, f"FPS: {current_fps:.1f}", (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-        cv2.putText(frame, f"ТС: {vehicle_count}", (10, 60),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-        cv2.putText(frame, f"Кадр: {frame_count}/{total_frames}", (10, 90),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+            # Рисуем bounding boxes (только если есть транспорт)
+            if vehicle_count > 0:
+                for i, box in enumerate(boxes):
+                    (x, y, w, h) = box
+                    # Рисуем прямоугольник
+                    cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                    
+                    # Добавляем подпись
+                    label = f"{classes[class_ids[i]]}: {confidences[i]:.2f}"
+                    cv2.putText(frame, label, (x, y - 5),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
-        # Сохраняем кадр и показываем
-        out.write(frame)
-        cv2.imshow("Vehicle Detection", frame)
+            # Рисуем парковочные места и их статус
+            free_count = 0
+            for i, (x, y, initial_status) in enumerate(parking_spots):
+                # Определяем цвет на основе текущей занятости
+                if occupied_spots[i]:
+                    color = (0, 0, 255)  # Красный - занято
+                else:
+                    color = (0, 255, 0)  # Зеленый - свободно
+                    free_count += 1
+                
+                # Рисуем точку с текущим статусом
+                cv2.circle(frame, (x, y), 8, color, -1)
+                cv2.putText(frame, str(i+1), (x+10, y+10), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
 
-        # Выход по ESC
-        if cv2.waitKey(1) == 27:
-            break
+            # Обновляем статистику с заданным интервалом
+            current_time = time.time()
+            if current_time - last_stat_update > stats_interval:
+                elapsed_time = current_time - start_time
+                current_fps = frame_count / elapsed_time if elapsed_time > 0 else 0
+                frame_count = 0
+                start_time = current_time
+                last_stat_update = current_time
 
-    # Завершение работы
-    cap.release()
-    out.release()
-    cv2.destroyAllWindows()
+            # Добавляем статистику на кадр
+            stream_type = "Видеопоток" if is_video_stream else "Статичное изображение"
+            stats = [
+                f"Парковка: {free_count}/{len(parking_spots)} св.",
+                f"ТС: {vehicle_count} | Всего: {total_vehicles}",
+                f"FPS: {current_fps:.1f} (Цель: {args.fps})",
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                f"Тип: {stream_type}",
+                f"Размер: {args.size}px | Устр: {args.device.upper()}"
+            ]
 
-    # Выводим статистику
-    total_time = time.time() - start_time
-    avg_fps = frame_count / total_time if total_time > 0 else 0
+            for i, stat in enumerate(stats):
+                cv2.putText(frame, stat, (10, 30 + i * 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
-    print(f"[РЕЗУЛЬТАТ] Обработка завершена!")
-    print(f"[РЕЗУЛЬТАТ] Всего обработано кадров: {frame_count}")
-    print(f"[РЕЗУЛЬТАТ] Средний FPS: {avg_fps:.1f}")
-    print(f"[РЕЗУЛЬТАТ] Результат сохранен в: {output_path}")
+            # Статус записи
+            if is_recording:
+                cv2.putText(frame, "REC", (frame.shape[1] - 100, 40),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+                recording_time = time.time() - recording_start_time
+                mins, secs = divmod(int(recording_time), 60)
+                cv2.putText(frame, f"{mins:02d}:{secs:02d}", (frame.shape[1] - 100, 80),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+
+            # Запись в видеофайл при активации
+            if is_recording and video_writer is not None:
+                video_writer.write(frame)
+
+                # Проверка максимального времени записи
+                if time.time() - recording_start_time > MAX_RECORDING_MINUTES * 60:
+                    stop_recording()
+
+            # Отображаем результат
+            cv2.imshow("Parking Lot Monitoring", frame)
+
+            # Обработка клавиш
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                break
+            elif key == ord('s'):
+                # Сохранение текущего снимка
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                filename = os.path.join(args.output, f"parking_snapshot_{timestamp}.jpg")
+                cv2.imwrite(filename, frame)
+                print(f"[INFO] Снимок сохранен: {filename}")
+            elif key == ord('r'):
+                # Начать/остановить запись
+                if is_recording:
+                    stop_recording()
+                else:
+                    start_recording(frame)
+            elif key == ord('m'):
+                # Переключение режима вручную
+                is_video_stream = not is_video_stream
+                if cap is not None:
+                    cap.release()
+                    cap = None
+                if is_video_stream:
+                    print("[INFO] Переключено на режим видеопотока")
+                    cap = create_video_capture(args.url)
+                else:
+                    print("[INFO] Переключено на режим статичного изображения")
+                    stop_event.clear()
+                    loader_thread = threading.Thread(target=image_loader, args=(args.url,), daemon=True)
+                    loader_thread.start()
+            elif key == ord('p'):
+                # Вход в режим разметки парковочных мест
+                if mark_parking_spots(frame):
+                    print("[INFO] Разметка парковочных мест сохранена")
+                else:
+                    print("[INFO] Разметка парковочных мест отменена")
+
+    except KeyboardInterrupt:
+        print("Программа остановлена пользователем")
+    except Exception as e:
+        print(f"Критическая ошибка: {e}")
+    finally:
+        stop_event.set()
+        if cap is not None and cap.isOpened():
+            cap.release()
+        if is_recording:
+            stop_recording()
+        cv2.destroyAllWindows()
+
+
+def start_recording(frame):
+    """Начинает запись видео"""
+    global is_recording, video_writer, recording_start_time
+
+    if not is_recording:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_path = os.path.join(args.output, f"parking_recording_{timestamp}.avi")
+
+        # Получаем размеры кадра
+        height, width = frame.shape[:2]
+
+        # Создаем VideoWriter
+        fourcc = cv2.VideoWriter_fourcc(*'XVID')
+        video_writer = cv2.VideoWriter(output_path, fourcc, args.fps, (width, height))
+
+        if video_writer.isOpened():
+            is_recording = True
+            recording_start_time = time.time()
+            print(f"[INFO] Начата запись видео: {output_path}")
+        else:
+            print("[ERROR] Не удалось создать видеофайл для записи")
+
+
+def stop_recording():
+    """Останавливает запись видео"""
+    global is_recording, video_writer
+
+    if is_recording and video_writer is not None:
+        video_writer.release()
+        is_recording = False
+        print("[INFO] Запись видео остановлена")
 
 
 def main():
     """Основная функция"""
-    # Определяем тип файла по расширению
-    input_path = args.input
-    ext = os.path.splitext(input_path)[1].lower()
+    print("=" * 70)
+    print(f"Система мониторинга парковки | {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    print("=" * 70)
+    print("Инструкция:")
+    print("- Нажмите 's' для сохранения снимка")
+    print("- Нажмите 'r' для начала/остановки записи видео")
+    print("- Нажмите 'm' для переключения режима (поток/изображение)")
+    print("- Нажмите 'p' для разметки парковочных мест")
+    print("- Нажмите 'q' для выхода из программы")
+    print(f"\nИспользуемая камера: {args.url}")
+    print(f"Модель: YOLOv4-tiny | Целевой FPS: {args.fps} | Устройство: {args.device.upper()}")
+    print("=" * 70)
 
-    # Обработка в зависимости от типа файла
-    if ext in ['.jpg', '.jpeg', '.png', '.bmp']:
-        process_image(input_path)
-    elif ext in ['.mp4', '.avi', '.mov']:
-        process_video(input_path)
-    else:
-        print(f"[ERROR] Неподдерживаемый формат файла: {ext}")
+    # Проверка наличия файлов модели
+    if not os.path.exists("yolov4-tiny.cfg") or not os.path.exists("yolov4-tiny.weights"):
+        print("[ERROR] Файлы модели YOLOv4-tiny не найдены!")
+        print("Необходимые файлы:")
+        print("  yolov4-tiny.cfg")
+        print("  yolov4-tiny.weights")
+        print("  coco.names")
+        print("\nСкачайте их по ссылкам:")
+        print("https://github.com/AlexeyAB/darknet/releases/download/darknet_yolo_v4_pre/yolov4-tiny.weights")
+        print("https://raw.githubusercontent.com/AlexeyAB/darknet/master/cfg/yolov4-tiny.cfg")
+        print("https://raw.githubusercontent.com/pjreddie/darknet/master/data/coco.names")
+        return
+
+    # Запуск обработки потока
+    process_stream()
 
 
 if __name__ == "__main__":
