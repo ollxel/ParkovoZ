@@ -11,7 +11,7 @@ import websockets
 import asyncio
 import json
 import logging
-from ultralytics import YOLO  # Добавляем импорт для YOLOv8
+from ultralytics import YOLO
 
 # Настройка аргументов командной строки
 parser = argparse.ArgumentParser(description='Parking Lot Monitoring System')
@@ -19,12 +19,12 @@ parser.add_argument('--url', type=str, required=True, help='Camera stream URL')
 parser.add_argument('--output', type=str, default='output', help='Output directory for results')
 parser.add_argument('--confidence', type=float, default=0.5, help='Confidence threshold')
 parser.add_argument('--nms', type=float, default=0.4, help='NMS threshold')
-parser.add_argument('--size', type=int, default=640, help='Input size for network')  # Размер по умолчанию для YOLOv8
+parser.add_argument('--size', type=int, default=640, help='Input size for network')
 parser.add_argument('--fps', type=int, default=15, help='Target FPS for video processing')
 parser.add_argument('--device', type=str, default='cpu', choices=['cpu', 'gpu'], help='Device for inference')
 parser.add_argument('--spots', type=str, default='parking_spots.txt', help='File to save/load parking spots')
 parser.add_argument('--ws-port', type=int, default=9000, help='WebSocket server port')
-parser.add_argument('--model', type=str, default='yolov8s.pt', help='Path to YOLOv8 model')  # Новый аргумент для модели
+parser.add_argument('--model', type=str, default='yolov8s.pt', help='Path to YOLOv8 model')
 args = parser.parse_args()
 
 # Создаем директорию для результатов
@@ -388,9 +388,6 @@ def process_stream():
 
             if frame is None:
                 # Показываем последний успешный кадр, если он есть
-                if 'last_good_frame' in locals():
-                    frame = last_good_frame
-                else:
                     continue
 
             # Кэшируем хороший кадр
@@ -406,6 +403,8 @@ def process_stream():
                     else:
                         logging.info("Разметка парковочных мест отменена, выход")
                         break
+                else:
+                    load_parking_spots(args.spots)
 
             # Обнаруживаем транспортные средства
             boxes, confidences, class_ids, indices, centers = detect_vehicles(frame)
@@ -420,18 +419,21 @@ def process_stream():
                 for center in centers:
                     # Проверяем расстояние от центра машины до точки парковки
                     distance = np.sqrt((x - center[0])**2 + (y - center[1])**2)
-                    # Если расстояние меньше порога (15 пикселей), считаем место занятым
-                    if distance < 15:
+                    # Если расстояние меньше порога (30 пикселей), считаем место занятым
+                    if distance < 30:
                         occupied_spots[i] = True
                         break
 
-            # Подготавливаем данные для отправки
-            spot_states = [1 if occupied else 0 for occupied in occupied_spots]
-            free_count = spot_states.count(0)
-            occupied_count = spot_states.count(1)
+            # Обновляем статус парковочных мест
+            for i, occupied in enumerate(occupied_spots):
+                parking_spots[i] = (parking_spots[i][0], parking_spots[i][1], 1 if occupied else 0)
             
             # Отправляем данные через WebSocket
             if ws_loop and ws_loop.is_running():
+                spot_states = [s[2] for s in parking_spots]
+                free_count = spot_states.count(0)
+                occupied_count = spot_states.count(1)
+                
                 asyncio.run_coroutine_threadsafe(
                     send_to_clients({
                         'type': 'parking_data',
@@ -457,9 +459,9 @@ def process_stream():
 
             # Рисуем парковочные места и их статус
             free_count = 0
-            for i, (x, y, initial_status) in enumerate(parking_spots):
+            for i, (x, y, status) in enumerate(parking_spots):
                 # Определяем цвет на основе текущей занятости
-                if occupied_spots[i]:
+                if status == 1:
                     color = (0, 0, 255)  # Красный - занято
                 else:
                     color = (0, 255, 0)  # Зеленый - свободно
@@ -587,7 +589,6 @@ def start_recording(frame):
         else:
             logging.error("Не удалось создать видеофайл для записи")
 
-
 def stop_recording():
     """Останавливает запись видео"""
     global is_recording, video_writer
@@ -596,7 +597,6 @@ def stop_recording():
         video_writer.release()
         is_recording = False
         logging.info("Запись видео остановлена")
-
 
 def main():
     """Основная функция"""
@@ -625,7 +625,6 @@ def main():
 
     # Запуск обработки потока
     process_stream()
-
 
 if __name__ == "__main__":
     main()
