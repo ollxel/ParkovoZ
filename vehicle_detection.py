@@ -7,6 +7,10 @@ import requests
 from datetime import datetime
 import threading
 import queue
+import websockets
+import asyncio
+import json
+import logging
 
 # Настройка аргументов командной строки
 parser = argparse.ArgumentParser(description='Parking Lot Monitoring System')
@@ -18,24 +22,28 @@ parser.add_argument('--size', type=int, default=320, help='Input size for networ
 parser.add_argument('--fps', type=int, default=15, help='Target FPS for video processing')
 parser.add_argument('--device', type=str, default='cpu', choices=['cpu', 'gpu'], help='Device for inference')
 parser.add_argument('--spots', type=str, default='parking_spots.txt', help='File to save/load parking spots')
+parser.add_argument('--ws-port', type=int, default=9000, help='WebSocket server port')
 args = parser.parse_args()
 
 # Создаем директорию для результатов
 os.makedirs(args.output, exist_ok=True)
 
+# Настройка логгера
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
 # Загрузка модели YOLOv4-tiny
-print("[INFO] Загрузка модели YOLOv4-tiny...")
+logging.info("Загрузка модели YOLOv4-tiny...")
 net = cv2.dnn.readNetFromDarknet("yolov4-tiny.cfg", "yolov4-tiny.weights")
 
 # Настройка устройства для вычислений
 if args.device == 'gpu':
     net.setPreferableBackend(cv2.dnn.DNN_BACKEND_CUDA)
     net.setPreferableTarget(cv2.dnn.DNN_TARGET_CUDA)
-    print("[INFO] Используется GPU для вычислений")
+    logging.info("Используется GPU для вычислений")
 else:
     net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
     net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
-    print("[INFO] Используется CPU для вычислений")
+    logging.info("Используется CPU для вычислений")
 
 # Загрузка названий классов
 with open("coco.names", "r") as f:
@@ -62,6 +70,61 @@ stop_event = threading.Event()
 parking_spots = []  # список кортежей (x, y, status): 0=свободно, 1=занято
 marking_mode = False
 current_spot_id = 0
+
+# WebSocket клиенты и event loop
+connected_clients = set()
+client_lock = threading.Lock()
+ws_loop = None
+
+async def websocket_handler(websocket, path):
+    with client_lock:
+        connected_clients.add(websocket)
+    logging.info(f"Новый клиент подключен. Всего клиентов: {len(connected_clients)}")
+    
+    try:
+        # Отправляем текущее состояние при подключении
+        if parking_spots:
+            spot_states = [s[2] for s in parking_spots]
+            await websocket.send(json.dumps({
+                'type': 'parking_data',
+                'data': spot_states,
+                'timestamp': datetime.now().isoformat()
+            }))
+        
+        # Ожидаем закрытия соединения
+        await websocket.wait_closed()
+    except Exception as e:
+        logging.error(f"WebSocket error: {e}")
+    finally:
+        with client_lock:
+            connected_clients.discard(websocket)
+
+async def send_to_clients(data):
+    if connected_clients:
+        for client in connected_clients.copy():
+            try:
+                await client.send(json.dumps(data))
+            except websockets.exceptions.ConnectionClosed:
+                logging.warning("Клиент отключился")
+                with client_lock:
+                    connected_clients.discard(client)
+
+def start_websocket_server():
+    global ws_loop
+    ws_loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(ws_loop)
+    
+    async def start():
+        server = await websockets.serve(
+            websocket_handler, 
+            "0.0.0.0",  # Слушаем все интерфейсы
+            args.ws_port
+        )
+        logging.info(f"WebSocket сервер запущен на порту {args.ws_port}")
+        await server.wait_closed()
+    
+    ws_loop.run_until_complete(start())
+    ws_loop.run_forever()
 
 def image_loader(url):
     """Поток для загрузки изображений"""
@@ -160,7 +223,7 @@ def save_parking_spots(filename):
     with open(filename, 'w') as f:
         for spot in parking_spots:
             f.write(f"{spot[0]},{spot[1]},{spot[2]}\n")
-    print(f"[INFO] Сохранено {len(parking_spots)} парковочных мест в {filename}")
+    logging.info(f"Сохранено {len(parking_spots)} парковочных мест в {filename}")
 
 def load_parking_spots(filename):
     """Загружает координаты парковочных мест из файла"""
@@ -173,7 +236,7 @@ def load_parking_spots(filename):
                 if len(parts) >= 3:
                     x, y, status = int(parts[0]), int(parts[1]), int(parts[2])
                     parking_spots.append((x, y, status))
-        print(f"[INFO] Загружено {len(parking_spots)} парковочных мест из {filename}")
+        logging.info(f"Загружено {len(parking_spots)} парковочных мест из {filename}")
         return True
     return False
 
@@ -185,7 +248,7 @@ def mouse_callback(event, x, y, flags, param):
         if event == cv2.EVENT_LBUTTONDOWN:
             # Добавляем свободное место (зеленое)
             parking_spots.append((x, y, 0))
-            print(f"Добавлено свободное место {len(parking_spots)}: ({x}, {y})")
+            logging.info(f"Добавлено свободное место {len(parking_spots)}: ({x}, {y})")
             # Рисуем точку на изображении
             cv2.circle(frame_copy, (x, y), 8, (0, 255, 0), -1)
             cv2.putText(frame_copy, str(len(parking_spots)), (x+10, y+10), 
@@ -195,7 +258,7 @@ def mouse_callback(event, x, y, flags, param):
         elif event == cv2.EVENT_RBUTTONDOWN:
             # Добавляем занятое место (красное)
             parking_spots.append((x, y, 1))
-            print(f"Добавлено занятое место {len(parking_spots)}: ({x}, {y})")
+            logging.info(f"Добавлено занятое место {len(parking_spots)}: ({x}, {y})")
             # Рисуем точку на изображении
             cv2.circle(frame_copy, (x, y), 8, (0, 0, 255), -1)
             cv2.putText(frame_copy, str(len(parking_spots)), (x+10, y+10), 
@@ -214,12 +277,12 @@ def mark_parking_spots(frame):
     cv2.setMouseCallback("Mark Parking Spots", mouse_callback, param=frame)
     
     # Инструкция
-    print("\n=== РЕЖИМ РАЗМЕТКИ ПАРКОВОЧНЫХ МЕСТ ===")
-    print("ЛКМ - добавить свободное место (зеленое)")
-    print("ПКМ - добавить занятое место (красное)")
-    print("'z' - удалить последнее добавленное место")
-    print("'s' - сохранить разметку")
-    print("'c' - отменить и выйти")
+    logging.info("\n=== РЕЖИМ РАЗМЕТКИ ПАРКОВОЧНЫХ МЕСТ ===")
+    logging.info("ЛКМ - добавить свободное место (зеленое)")
+    logging.info("ПКМ - добавить занятое место (красное)")
+    logging.info("'z' - удалить последнее добавленное место")
+    logging.info("'s' - сохранить разметку")
+    logging.info("'c' - отменить и выйти")
     
     while True:
         cv2.imshow("Mark Parking Spots", frame_copy)
@@ -232,20 +295,20 @@ def mark_parking_spots(frame):
                 cv2.destroyWindow("Mark Parking Spots")
                 return True
             else:
-                print("[WARNING] Нет парковочных мест для сохранения!")
+                logging.warning("Нет парковочных мест для сохранения!")
         
         elif key == ord('c'):
             parking_spots = []
             marking_mode = False
             cv2.destroyWindow("Mark Parking Spots")
-            print("[INFO] Разметка отменена")
+            logging.info("Разметка отменена")
             return False
         
         elif key == ord('z'):
             # Удаляем последнее добавленное место
             if parking_spots:
                 removed = parking_spots.pop()
-                print(f"Удалено парковочное место: {removed}")
+                logging.info(f"Удалено парковочное место: {removed}")
                 # Перерисовываем изображение
                 frame_copy = frame.copy()
                 for i, (x, y, status) in enumerate(parking_spots):
@@ -259,7 +322,7 @@ def process_stream():
     """Обработка потока с камеры в реальном времени"""
     global is_recording, video_writer, recording_start_time, parking_spots, marking_mode
 
-    print(f"[INFO] Запуск мониторинга парковки: {args.url}")
+    logging.info(f"Запуск мониторинга парковки: {args.url}")
 
     # Автоматическое определение типа потока
     is_video_stream = False
@@ -274,7 +337,7 @@ def process_stream():
                 ret, test_frame = cap.read()
                 if ret and test_frame is not None:
                     is_video_stream = True
-                    print("[INFO] Режим: MJPEG видеопоток")
+                    logging.info("Режим: MJPEG видеопоток")
                 else:
                     cap.release()
                     cap = None
@@ -283,7 +346,7 @@ def process_stream():
 
     # Запускаем поток загрузки изображений для статичного режима
     if not is_video_stream:
-        print("[INFO] Режим: Статичное изображение (многопоточная загрузка)")
+        logging.info("Режим: Статичное изображение (многопоточная загрузка)")
         loader_thread = threading.Thread(target=image_loader, args=(args.url,), daemon=True)
         loader_thread.start()
 
@@ -321,14 +384,14 @@ def process_stream():
                 if not ret or frame is None:
                     # Проблемы с чтением кадра
                     if current_time - last_success_time > 5:
-                        print("Ошибка чтения видеопотока. Попытка переподключения...")
+                        logging.warning("Ошибка чтения видеопотока. Попытка переподключения...")
                         cap.release()
                         cap = create_video_capture(args.url)
                         reconnect_attempts += 1
 
                         # Если переподключение не удалось 5 раз, переключаем режим
                         if reconnect_attempts > 5 or not cap.isOpened():
-                            print("Не удалось восстановить видеопоток. Переключение на режим статичного изображения")
+                            logging.warning("Не удалось восстановить видеопоток. Переключение на режим статичного изображения")
                             is_video_stream = False
                             loader_thread = threading.Thread(target=image_loader, args=(args.url,), daemon=True)
                             loader_thread.start()
@@ -355,11 +418,11 @@ def process_stream():
             if not first_frame_processed:
                 first_frame_processed = True
                 if not os.path.exists(args.spots):
-                    print("[INFO] Файл с разметкой не найден, запуск режима разметки...")
+                    logging.info("Файл с разметкой не найден, запуск режима разметки...")
                     if mark_parking_spots(frame):
-                        print("[INFO] Разметка парковочных мест сохранена")
+                        logging.info("Разметка парковочных мест сохранена")
                     else:
-                        print("[INFO] Разметка парковочных мест отменена, выход")
+                        logging.info("Разметка парковочных мест отменена, выход")
                         break
 
             # Обнаруживаем транспортные средства
@@ -379,6 +442,24 @@ def process_stream():
                     if distance < 15:
                         occupied_spots[i] = True
                         break
+
+            # Подготавливаем данные для отправки
+            spot_states = [1 if occupied else 0 for occupied in occupied_spots]
+            free_count = spot_states.count(0)
+            occupied_count = spot_states.count(1)
+            
+            # Отправляем данные через WebSocket
+            if ws_loop and ws_loop.is_running():
+                asyncio.run_coroutine_threadsafe(
+                    send_to_clients({
+                        'type': 'parking_data',
+                        'data': spot_states,
+                        'free': free_count,
+                        'occupied': occupied_count,
+                        'timestamp': datetime.now().isoformat()
+                    }), 
+                    ws_loop
+                )
 
             # Рисуем bounding boxes (только если есть транспорт)
             if vehicle_count > 0:
@@ -460,7 +541,7 @@ def process_stream():
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                 filename = os.path.join(args.output, f"parking_snapshot_{timestamp}.jpg")
                 cv2.imwrite(filename, frame)
-                print(f"[INFO] Снимок сохранен: {filename}")
+                logging.info(f"Снимок сохранен: {filename}")
             elif key == ord('r'):
                 # Начать/остановить запись
                 if is_recording:
@@ -474,24 +555,24 @@ def process_stream():
                     cap.release()
                     cap = None
                 if is_video_stream:
-                    print("[INFO] Переключено на режим видеопотока")
+                    logging.info("Переключено на режим видеопотока")
                     cap = create_video_capture(args.url)
                 else:
-                    print("[INFO] Переключено на режим статичного изображения")
+                    logging.info("Переключено на режим статичного изображения")
                     stop_event.clear()
                     loader_thread = threading.Thread(target=image_loader, args=(args.url,), daemon=True)
                     loader_thread.start()
             elif key == ord('p'):
                 # Вход в режим разметки парковочных мест
                 if mark_parking_spots(frame):
-                    print("[INFO] Разметка парковочных мест сохранена")
+                    logging.info("Разметка парковочных мест сохранена")
                 else:
-                    print("[INFO] Разметка парковочных мест отменена")
+                    logging.info("Разметка парковочных мест отменена")
 
     except KeyboardInterrupt:
-        print("Программа остановлена пользователем")
+        logging.info("Программа остановлена пользователем")
     except Exception as e:
-        print(f"Критическая ошибка: {e}")
+        logging.error(f"Критическая ошибка: {e}")
     finally:
         stop_event.set()
         if cap is not None and cap.isOpened():
@@ -519,9 +600,9 @@ def start_recording(frame):
         if video_writer.isOpened():
             is_recording = True
             recording_start_time = time.time()
-            print(f"[INFO] Начата запись видео: {output_path}")
+            logging.info(f"Начата запись видео: {output_path}")
         else:
-            print("[ERROR] Не удалось создать видеофайл для записи")
+            logging.error("Не удалось создать видеофайл для записи")
 
 
 def stop_recording():
@@ -531,7 +612,7 @@ def stop_recording():
     if is_recording and video_writer is not None:
         video_writer.release()
         is_recording = False
-        print("[INFO] Запись видео остановлена")
+        logging.info("Запись видео остановлена")
 
 
 def main():
@@ -561,6 +642,10 @@ def main():
         print("https://raw.githubusercontent.com/AlexeyAB/darknet/master/cfg/yolov4-tiny.cfg")
         print("https://raw.githubusercontent.com/pjreddie/darknet/master/data/coco.names")
         return
+
+    # Запуск WebSocket сервера в отдельном потоке
+    ws_thread = threading.Thread(target=start_websocket_server, daemon=True)
+    ws_thread.start()
 
     # Запуск обработки потока
     process_stream()
