@@ -75,17 +75,31 @@ async def websocket_handler(websocket, path):
     logging.info(f"Новый клиент подключен. Всего клиентов: {len(connected_clients)}")
     
     try:
-        # Отправляем текущее состояние при подключении
-        if parking_spots:
-            spot_states = [s[2] for s in parking_spots]
-            await websocket.send(json.dumps({
-                'type': 'parking_data',
-                'data': spot_states,
-                'timestamp': datetime.now().isoformat()
-            }))
-        
-        # Ожидаем закрытия соединения
-        await websocket.wait_closed()
+        # Обрабатываем входящие сообщения
+        async for message in websocket:
+            try:
+                if message == "ping":
+                    continue
+                
+                data = json.loads(message)
+                if data.get('type') == 'request_data':
+                    if parking_spots:
+                        spot_states = [s[2] for s in parking_spots]
+                        free_count = spot_states.count(0)
+                        occupied_count = spot_states.count(1)
+                        
+                        await websocket.send(json.dumps({
+                            'type': 'parking_data',
+                            'data': spot_states,
+                            'free': free_count,
+                            'occupied': occupied_count,
+                            'timestamp': datetime.now().isoformat()
+                        }))
+            except json.JSONDecodeError:
+                # Игнорируем не-JSON сообщения
+                continue
+            except Exception as e:
+                logging.error(f"Ошибка обработки сообщения от клиента: {e}")
     except Exception as e:
         logging.error(f"WebSocket error: {e}")
     finally:
@@ -388,7 +402,7 @@ def process_stream():
 
             if frame is None:
                 # Показываем последний успешный кадр, если он есть
-                    continue
+                continue
 
             # Кэшируем хороший кадр
             last_good_frame = frame.copy()
@@ -428,12 +442,13 @@ def process_stream():
             for i, occupied in enumerate(occupied_spots):
                 parking_spots[i] = (parking_spots[i][0], parking_spots[i][1], 1 if occupied else 0)
             
+            # Подготавливаем данные для отправки
+            spot_states = [s[2] for s in parking_spots]
+            free_count = spot_states.count(0)
+            occupied_count = spot_states.count(1)
+            
             # Отправляем данные через WebSocket
             if ws_loop and ws_loop.is_running():
-                spot_states = [s[2] for s in parking_spots]
-                free_count = spot_states.count(0)
-                occupied_count = spot_states.count(1)
-                
                 asyncio.run_coroutine_threadsafe(
                     send_to_clients({
                         'type': 'parking_data',
