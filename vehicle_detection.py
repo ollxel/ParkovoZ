@@ -11,6 +11,7 @@ import websockets
 import asyncio
 import json
 import logging
+from ultralytics import YOLO  # Добавляем импорт для YOLOv8
 
 # Настройка аргументов командной строки
 parser = argparse.ArgumentParser(description='Parking Lot Monitoring System')
@@ -18,11 +19,12 @@ parser.add_argument('--url', type=str, required=True, help='Camera stream URL')
 parser.add_argument('--output', type=str, default='output', help='Output directory for results')
 parser.add_argument('--confidence', type=float, default=0.5, help='Confidence threshold')
 parser.add_argument('--nms', type=float, default=0.4, help='NMS threshold')
-parser.add_argument('--size', type=int, default=320, help='Input size for network')
+parser.add_argument('--size', type=int, default=640, help='Input size for network')  # Размер по умолчанию для YOLOv8
 parser.add_argument('--fps', type=int, default=15, help='Target FPS for video processing')
 parser.add_argument('--device', type=str, default='cpu', choices=['cpu', 'gpu'], help='Device for inference')
 parser.add_argument('--spots', type=str, default='parking_spots.txt', help='File to save/load parking spots')
 parser.add_argument('--ws-port', type=int, default=9000, help='WebSocket server port')
+parser.add_argument('--model', type=str, default='yolov8s.pt', help='Path to YOLOv8 model')  # Новый аргумент для модели
 args = parser.parse_args()
 
 # Создаем директорию для результатов
@@ -31,19 +33,14 @@ os.makedirs(args.output, exist_ok=True)
 # Настройка логгера
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# Загрузка модели YOLOv4-tiny
-logging.info("Загрузка модели YOLOv4-tiny...")
-net = cv2.dnn.readNetFromDarknet("yolov4-tiny.cfg", "yolov4-tiny.weights")
+# Загрузка модели YOLOv8
+logging.info(f"Загрузка модели YOLOv8: {args.model}")
+model = YOLO(args.model)
 
 # Настройка устройства для вычислений
-if args.device == 'gpu':
-    net.setPreferableBackend(cv2.dnn.DNN_BACKEND_CUDA)
-    net.setPreferableTarget(cv2.dnn.DNN_TARGET_CUDA)
-    logging.info("Используется GPU для вычислений")
-else:
-    net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
-    net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
-    logging.info("Используется CPU для вычислений")
+device = 'cuda' if args.device == 'gpu' else 'cpu'
+model.to(device)
+logging.info(f"Используется {device.upper()} для вычислений")
 
 # Загрузка названий классов
 with open("coco.names", "r") as f:
@@ -51,10 +48,6 @@ with open("coco.names", "r") as f:
 
 # ID классов для транспорта
 VEHICLE_IDS = [2, 3, 5, 7]  # car, motorcycle, bus, truck
-
-# Получение выходных слоев
-layer_names = net.getLayerNames()
-output_layers = [layer_names[i - 1] for i in net.getUnconnectedOutLayers()]
 
 # Статус записи видео
 is_recording = False
@@ -152,64 +145,53 @@ def image_loader(url):
         time.sleep(0.05)
 
 def detect_vehicles(image):
-    """Обнаружение транспортных средств на изображении"""
+    """Обнаружение транспортных средств на изображении с помощью YOLOv8"""
     height, width = image.shape[:2]
-
-    # Создаем blob для нейросети
-    blob = cv2.dnn.blobFromImage(
+    
+    # Выполняем детекцию
+    results = model.predict(
         image,
-        1 / 255.0,
-        (args.size, args.size),
-        swapRB=True,
-        crop=False
+        imgsz=args.size,
+        conf=args.confidence,
+        iou=args.nms,
+        device=device,
+        verbose=False
     )
-
-    # Подаем blob в сеть
-    net.setInput(blob)
-    outputs = net.forward(output_layers)
-
-    # Обработка результатов
+    
     boxes = []
     confidences = []
     class_ids = []
-    centers = []  # центры bounding box'ов
+    centers = []
 
-    for output in outputs:
-        for detection in output:
-            scores = detection[5:]
-            class_id = np.argmax(scores)
-            confidence = scores[class_id]
+    # Обработка результатов
+    for result in results:
+        if result.boxes is not None:
+            for box in result.boxes:
+                # Фильтрация по классу транспортных средств
+                if int(box.cls) in VEHICLE_IDS:
+                    # Координаты bounding box
+                    x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+                    
+                    # Гарантируем, что координаты в пределах изображения
+                    x1, y1 = max(0, x1), max(0, y1)
+                    x2, y2 = min(width, x2), min(height, y2)
+                    
+                    w = x2 - x1
+                    h = y2 - y1
+                    
+                    # Центр bounding box
+                    center_x = int((x1 + x2) / 2)
+                    center_y = int((y1 + y2) / 2)
+                    
+                    boxes.append([x1, y1, w, h])
+                    centers.append((center_x, center_y))
+                    confidences.append(float(box.conf))
+                    class_ids.append(int(box.cls))
 
-            if confidence > args.confidence and class_id in VEHICLE_IDS:
-                # Масштабируем координаты bounding box
-                box = detection[0:4] * np.array([width, height, width, height])
-                (center_x, center_y, w, h) = box.astype("int")
-
-                # Получаем координаты верхнего левого угла
-                x = int(center_x - (w / 2))
-                y = int(center_y - (h / 2))
-
-                # Гарантируем, что координаты в пределах изображения
-                x, y = max(0, x), max(0, y)
-                w, h = min(width - x, int(w)), min(height - y, int(h))
-
-                boxes.append([x, y, w, h])
-                centers.append((int(center_x), int(center_y)))
-                confidences.append(float(confidence))
-                class_ids.append(class_id)
-
-    # Применяем Non-Maximum Suppression
-    indices = cv2.dnn.NMSBoxes(boxes, confidences, args.confidence, args.nms)
-
-    # Фильтруем результаты после NMS
-    filtered_boxes = []
-    filtered_centers = []
-    if len(indices) > 0:
-        for i in indices.flatten():
-            filtered_boxes.append(boxes[i])
-            filtered_centers.append(centers[i])
-
-    return filtered_boxes, confidences, class_ids, indices, filtered_centers
+    # Для совместимости с оригинальным интерфейсом
+    indices = list(range(len(boxes))) if boxes else []
+    
+    return boxes, confidences, class_ids, indices, centers
 
 def create_video_capture(url):
     """Создает объект VideoCapture для потокового видео"""
@@ -427,7 +409,7 @@ def process_stream():
 
             # Обнаруживаем транспортные средства
             boxes, confidences, class_ids, indices, centers = detect_vehicles(frame)
-            vehicle_count = len(indices) if isinstance(indices, np.ndarray) else 0
+            vehicle_count = len(indices) if isinstance(indices, list) else 0
             total_vehicles += vehicle_count
 
             # Определяем занятость парковочных мест
@@ -505,7 +487,8 @@ def process_stream():
                 f"FPS: {current_fps:.1f} (Цель: {args.fps})",
                 datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 f"Тип: {stream_type}",
-                f"Размер: {args.size}px | Устр: {args.device.upper()}"
+                f"Размер: {args.size}px | Устр: {args.device.upper()}",
+                f"Модель: {os.path.basename(args.model)}"
             ]
 
             for i, stat in enumerate(stats):
@@ -627,20 +610,13 @@ def main():
     print("- Нажмите 'p' для разметки парковочных мест")
     print("- Нажмите 'q' для выхода из программы")
     print(f"\nИспользуемая камера: {args.url}")
-    print(f"Модель: YOLOv4-tiny | Целевой FPS: {args.fps} | Устройство: {args.device.upper()}")
+    print(f"Модель: YOLOv8 | Размер: {args.size}px | Устройство: {args.device.upper()}")
     print("=" * 70)
 
-    # Проверка наличия файлов модели
-    if not os.path.exists("yolov4-tiny.cfg") or not os.path.exists("yolov4-tiny.weights"):
-        print("[ERROR] Файлы модели YOLOv4-tiny не найдены!")
-        print("Необходимые файлы:")
-        print("  yolov4-tiny.cfg")
-        print("  yolov4-tiny.weights")
-        print("  coco.names")
-        print("\nСкачайте их по ссылкам:")
-        print("https://github.com/AlexeyAB/darknet/releases/download/darknet_yolo_v4_pre/yolov4-tiny.weights")
-        print("https://raw.githubusercontent.com/AlexeyAB/darknet/master/cfg/yolov4-tiny.cfg")
-        print("https://raw.githubusercontent.com/pjreddie/darknet/master/data/coco.names")
+    # Проверка наличия файла модели
+    if not os.path.exists(args.model):
+        print(f"[ERROR] Файл модели YOLOv8 не найден: {args.model}")
+        print("Скачайте предобученные модели с https://github.com/ultralytics/ultralytics")
         return
 
     # Запуск WebSocket сервера в отдельном потоке
